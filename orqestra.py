@@ -17,18 +17,37 @@ DEFAULT_DB_DIR = os.environ.get("ORQESTRA_DB_DIR", "./database")
 DEFAULT_DB = os.environ.get("ORQESTRA_DB", os.path.join(DEFAULT_DB_DIR, "orqestra.db"))
 MASTER_KEY_FILE = os.path.join(DEFAULT_DB_DIR, "master.key")
 
+# -------------------------
+# Provider defaults
+# -------------------------
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
-# Gemini: use the official "models/..." names
 DEFAULT_GEMINI_MODEL = "models/gemini-2.5-flash"
 
 DEFAULT_OLLAMA_BASE = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
 
-# Gemini models list (arrow-key select)
+# -------------------------
+# Arrow-key selectable model lists
+# -------------------------
+OPENAI_MODEL_CHOICES = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+    "o4-mini",
+    "o3-mini",
+]
+
+ANTHROPIC_MODEL_CHOICES = [
+    "claude-sonnet-4-6",
+    "claude-opus-4-1",
+    "claude-haiku-3-5",
+]
+
 GEMINI_MODEL_CHOICES = [
     "models/gemini-2.5-flash",
     "models/gemini-2.5-pro",
@@ -40,6 +59,14 @@ GEMINI_MODEL_CHOICES = [
     "models/gemini-flash-latest",
     "models/gemini-flash-lite-latest",
     "models/gemini-pro-latest",
+]
+
+OLLAMA_MODEL_CHOICES = [
+    "llama3.1:8b",
+    "llama3.1:70b",
+    "mistral:7b",
+    "qwen2.5:7b",
+    "gemma2:9b",
 ]
 
 
@@ -187,7 +214,6 @@ def call_anthropic(api_key: str, message: str, model: str, timeout: int = 60) ->
 
 
 def call_gemini(api_key: str, message: str, model: str, timeout: int = 60) -> str:
-    # model MUST be "models/...."
     url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
     params = {"key": api_key}
     headers = {"Content-Type": "application/json"}
@@ -325,7 +351,7 @@ def run_message(conn: sqlite3.Connection, message: str, provider_filter: Optiona
 
 
 # -------------------------
-# Onboarding (Gemini model via arrow keys ONLY)
+# Onboarding (all models via arrow keys selection)
 # -------------------------
 def onboard(conn: sqlite3.Connection) -> None:
     existing = get_all_settings(conn)
@@ -388,56 +414,72 @@ def onboard(conn: sqlite3.Connection) -> None:
     enable_gemini = "Gemini" in providers
     enable_ollama = "Ollama (local)" in providers
 
-    # Provider configs
+    # --- OpenAI ---
     openai_key = ""
-    anthropic_key = ""
-    gemini_key = ""
-
     openai_base_url = existing.get("provider.openai.base_url", DEFAULT_OPENAI_BASE_URL)
-    openai_model = existing.get("provider.openai.model", DEFAULT_OPENAI_MODEL)
-    anthropic_model = existing.get("provider.anthropic.model", DEFAULT_ANTHROPIC_MODEL)
-
-    gemini_model_existing = existing.get("provider.gemini.model", DEFAULT_GEMINI_MODEL)
-    if gemini_model_existing not in GEMINI_MODEL_CHOICES:
-        # if it was custom before, fall back to default list
-        gemini_model_existing = DEFAULT_GEMINI_MODEL if DEFAULT_GEMINI_MODEL in GEMINI_MODEL_CHOICES else GEMINI_MODEL_CHOICES[0]
-
-    ollama_base = existing.get("provider.ollama.base_url", DEFAULT_OLLAMA_BASE)
-    ollama_model = existing.get("provider.ollama.model", DEFAULT_OLLAMA_MODEL)
+    openai_model_existing = existing.get("provider.openai.model", DEFAULT_OPENAI_MODEL)
+    if openai_model_existing not in OPENAI_MODEL_CHOICES:
+        openai_model_existing = DEFAULT_OPENAI_MODEL if DEFAULT_OPENAI_MODEL in OPENAI_MODEL_CHOICES else OPENAI_MODEL_CHOICES[0]
 
     if enable_openai:
         openai_base_url = questionary.text("OpenAI base URL:", default=openai_base_url).ask() or openai_base_url
-        openai_model = questionary.text("OpenAI model:", default=openai_model).ask() or openai_model
+        openai_model = questionary.select("OpenAI model (arrow keys):", choices=OPENAI_MODEL_CHOICES, default=openai_model_existing).ask()
+        if openai_model is None:
+            raise SystemExit(130)
         openai_key = questionary.password("OpenAI API key (hidden):").ask() or ""
         if not openai_key.strip():
             questionary.print("OpenAI API key is required when OpenAI is enabled.", style="bold fg:red")
             raise SystemExit(2)
+    else:
+        openai_model = openai_model_existing
+
+    # --- Anthropic ---
+    anthropic_key = ""
+    anthropic_model_existing = existing.get("provider.anthropic.model", DEFAULT_ANTHROPIC_MODEL)
+    if anthropic_model_existing not in ANTHROPIC_MODEL_CHOICES:
+        anthropic_model_existing = DEFAULT_ANTHROPIC_MODEL if DEFAULT_ANTHROPIC_MODEL in ANTHROPIC_MODEL_CHOICES else ANTHROPIC_MODEL_CHOICES[0]
 
     if enable_anthropic:
-        anthropic_model = questionary.text("Anthropic model:", default=anthropic_model).ask() or anthropic_model
+        anthropic_model = questionary.select("Anthropic model (arrow keys):", choices=ANTHROPIC_MODEL_CHOICES, default=anthropic_model_existing).ask()
+        if anthropic_model is None:
+            raise SystemExit(130)
         anthropic_key = questionary.password("Anthropic API key (hidden):").ask() or ""
         if not anthropic_key.strip():
             questionary.print("Anthropic API key is required when Anthropic is enabled.", style="bold fg:red")
             raise SystemExit(2)
+    else:
+        anthropic_model = anthropic_model_existing
+
+    # --- Gemini ---
+    gemini_key = ""
+    gemini_model_existing = existing.get("provider.gemini.model", DEFAULT_GEMINI_MODEL)
+    if gemini_model_existing not in GEMINI_MODEL_CHOICES:
+        gemini_model_existing = DEFAULT_GEMINI_MODEL if DEFAULT_GEMINI_MODEL in GEMINI_MODEL_CHOICES else GEMINI_MODEL_CHOICES[0]
 
     if enable_gemini:
-        # ONLY arrow-key selection, no free text
-        gemini_model = questionary.select(
-            "Gemini model (use arrow keys):",
-            choices=GEMINI_MODEL_CHOICES,
-            default=gemini_model_existing,
-        ).ask()
+        gemini_model = questionary.select("Gemini model (arrow keys):", choices=GEMINI_MODEL_CHOICES, default=gemini_model_existing).ask()
         if gemini_model is None:
             raise SystemExit(130)
-
         gemini_key = questionary.password("Gemini API key (hidden):").ask() or ""
         if not gemini_key.strip():
             questionary.print("Gemini API key is required when Gemini is enabled.", style="bold fg:red")
             raise SystemExit(2)
+    else:
+        gemini_model = gemini_model_existing
+
+    # --- Ollama ---
+    ollama_base = existing.get("provider.ollama.base_url", DEFAULT_OLLAMA_BASE)
+    ollama_model_existing = existing.get("provider.ollama.model", DEFAULT_OLLAMA_MODEL)
+    if ollama_model_existing not in OLLAMA_MODEL_CHOICES:
+        ollama_model_existing = DEFAULT_OLLAMA_MODEL if DEFAULT_OLLAMA_MODEL in OLLAMA_MODEL_CHOICES else OLLAMA_MODEL_CHOICES[0]
 
     if enable_ollama:
         ollama_base = questionary.text("Ollama base URL:", default=ollama_base).ask() or ollama_base
-        ollama_model = questionary.text("Ollama model:", default=ollama_model).ask() or ollama_model
+        ollama_model = questionary.select("Ollama model (arrow keys):", choices=OLLAMA_MODEL_CHOICES, default=ollama_model_existing).ask()
+        if ollama_model is None:
+            raise SystemExit(130)
+    else:
+        ollama_model = ollama_model_existing
 
     db_path = questionary.text("SQLite DB path:", default=existing.get("db.path", DEFAULT_DB)).ask()
     if db_path is None:
@@ -455,22 +497,21 @@ def onboard(conn: sqlite3.Connection) -> None:
     set_setting(conn, "autoupdate.enabled", "true" if autoupdate_enabled else "false")
     set_setting(conn, "secrets.auth.token", encrypt_secret(master_key, auth_token.strip()) if auth_enabled else "")
 
-    # Save provider flags
+    # Provider flags
     set_setting(conn, "provider.openai.enabled", "true" if enable_openai else "false")
     set_setting(conn, "provider.anthropic.enabled", "true" if enable_anthropic else "false")
     set_setting(conn, "provider.gemini.enabled", "true" if enable_gemini else "false")
     set_setting(conn, "provider.ollama.enabled", "true" if enable_ollama else "false")
 
-    # Save provider config
+    # Provider config
     set_setting(conn, "provider.openai.base_url", openai_base_url.strip())
     set_setting(conn, "provider.openai.model", openai_model.strip())
     set_setting(conn, "provider.anthropic.model", anthropic_model.strip())
-    if enable_gemini:
-        set_setting(conn, "provider.gemini.model", gemini_model.strip())
+    set_setting(conn, "provider.gemini.model", gemini_model.strip())
     set_setting(conn, "provider.ollama.base_url", ollama_base.strip())
     set_setting(conn, "provider.ollama.model", ollama_model.strip())
 
-    # Save secrets
+    # Secrets
     set_setting(conn, "secrets.openai.api_key", encrypt_secret(master_key, openai_key.strip()) if enable_openai else "")
     set_setting(conn, "secrets.anthropic.api_key", encrypt_secret(master_key, anthropic_key.strip()) if enable_anthropic else "")
     set_setting(conn, "secrets.gemini.api_key", encrypt_secret(master_key, gemini_key.strip()) if enable_gemini else "")
