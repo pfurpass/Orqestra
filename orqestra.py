@@ -3,8 +3,14 @@ import argparse
 import base64
 import json
 import os
+import re
 import sqlite3
-from typing import Dict, Optional, List, Tuple
+import sys
+import threading
+import time
+import subprocess
+from pathlib import Path
+from typing import Dict, Optional, List, Tuple, Any
 
 import questionary
 import requests
@@ -16,6 +22,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 DEFAULT_DB_DIR = os.environ.get("ORQESTRA_DB_DIR", "./database")
 DEFAULT_DB = os.environ.get("ORQESTRA_DB", os.path.join(DEFAULT_DB_DIR, "orqestra.db"))
 MASTER_KEY_FILE = os.path.join(DEFAULT_DB_DIR, "master.key")
+
+WORKSPACE_ROOT = Path(os.environ.get("ORQESTRA_WORKSPACE", "./workspace")).resolve()
 
 # -------------------------
 # Provider defaults
@@ -31,7 +39,7 @@ DEFAULT_OLLAMA_BASE = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
 
 # -------------------------
-# Arrow-key selectable model lists
+# Arrow-key selectable model lists (remote providers)
 # -------------------------
 OPENAI_MODEL_CHOICES = [
     "gpt-4o-mini",
@@ -61,13 +69,41 @@ GEMINI_MODEL_CHOICES = [
     "models/gemini-pro-latest",
 ]
 
-OLLAMA_MODEL_CHOICES = [
-    "llama3.1:8b",
-    "llama3.1:70b",
-    "mistral:7b",
-    "qwen2.5:7b",
-    "gemma2:9b",
-]
+# -------------------------
+# Spinner / "waiting" animation
+# -------------------------
+class Spinner:
+    def __init__(self, text: str = "Waiting for the agent"):
+        self.text = text
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+
+        self._stop.clear()
+
+        def run():
+            i = 0
+            while not self._stop.is_set():
+                frame = self._frames[i % len(self._frames)]
+                sys.stdout.write(f"\r{frame} {self.text}...")
+                sys.stdout.flush()
+                i += 1
+                time.sleep(0.1)
+            # clear line
+            sys.stdout.write("\r" + (" " * (len(self.text) + 10)) + "\r")
+            sys.stdout.flush()
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
 
 
 # -------------------------
@@ -79,17 +115,18 @@ def ensure_parent_dir(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
+def safe_join(base: Path, rel: str) -> Path:
+    # Prevent ../../ escape
+    p = (base / rel).resolve()
+    if not str(p).startswith(str(base)):
+        raise ValueError(f"Refusing to access outside workspace: {rel}")
+    return p
+
+
 # -------------------------
 # Crypto helpers (AES-256-GCM)
 # -------------------------
 def load_or_create_master_key() -> bytes:
-    """
-    32 bytes key for AES-256-GCM.
-    Priority:
-      1) ORQESTRA_MASTER_KEY (base64)
-      2) ./database/master.key (base64)
-      3) create new and store to file
-    """
     env = os.environ.get("ORQESTRA_MASTER_KEY")
     if env:
         key = base64.b64decode(env.encode("utf-8"))
@@ -171,7 +208,7 @@ def get_all_settings(conn: sqlite3.Connection) -> Dict[str, str]:
 
 
 # -------------------------
-# Provider calls
+# Provider calls + model listing
 # -------------------------
 class ProviderError(Exception):
     pass
@@ -202,7 +239,7 @@ def call_anthropic(api_key: str, message: str, model: str, timeout: int = 60) ->
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    payload = {"model": model, "max_tokens": 1024, "messages": [{"role": "user", "content": message}]}
+    payload = {"model": model, "max_tokens": 2048, "messages": [{"role": "user", "content": message}]}
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code >= 400:
         raise ProviderError(f"Anthropic error {r.status_code}: {r.text}")
@@ -213,26 +250,56 @@ def call_anthropic(api_key: str, message: str, model: str, timeout: int = 60) ->
     return "\n".join(texts) if texts else json.dumps(data, indent=2)
 
 
-def call_gemini(api_key: str, message: str, model: str, timeout: int = 60) -> str:
+def call_gemini(api_key: str, message: str, model: str, timeout: int = 60, force_json: bool = False) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
     params = {"key": api_key}
     headers = {"Content-Type": "application/json"}
-    payload = {"contents": [{"role": "user", "parts": [{"text": message}]}]}
+
+    payload: Dict[str, Any] = {
+        "contents": [{"role": "user", "parts": [{"text": message}]}],
+        "generationConfig": {
+            "maxOutputTokens": 4096,
+        },
+    }
+
+    if force_json:
+        payload["generationConfig"]["response_mime_type"] = "application/json"
+
     r = requests.post(url, params=params, headers=headers, json=payload, timeout=timeout)
     if r.status_code >= 400:
         raise ProviderError(f"Gemini error {r.status_code}: {r.text}")
+
     data = r.json()
     try:
         cand = (data.get("candidates") or [None])[0] or {}
         content = cand.get("content") or {}
         parts = content.get("parts") or []
-        texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-        texts = [t for t in texts if t]
+        texts = []
+        for p in parts:
+            if isinstance(p, dict):
+                t = p.get("text", "")
+                if t:
+                    texts.append(t)
         if texts:
-            return "\n".join(texts)
+            return "\n".join(texts).strip()
     except Exception:
         pass
+
     return json.dumps(data, indent=2)
+
+
+def ollama_list_models(base_url: str, timeout: int = 10) -> List[str]:
+    url = base_url.rstrip("/") + "/api/tags"
+    r = requests.get(url, timeout=timeout)
+    if r.status_code >= 400:
+        raise ProviderError(f"Ollama /api/tags error {r.status_code}: {r.text}")
+    data = r.json()
+    models = []
+    for m in data.get("models", []):
+        name = m.get("name")
+        if name:
+            models.append(name)
+    return sorted(set(models))
 
 
 def call_ollama(base_url: str, message: str, model: str, timeout: int = 60) -> str:
@@ -269,25 +336,69 @@ def read_secret(settings: Dict[str, str], master_key: bytes, key: str, fallback_
     return decrypt_secret(master_key, v) if v else ""
 
 
+def provider_alias(p: str) -> str:
+    aliases = {
+        "openai": "openai",
+        "anthropic": "anthropic",
+        "claude": "anthropic",
+        "gemini": "gemini",
+        "google": "gemini",
+        "ollama": "ollama",
+        "local": "ollama",
+    }
+    return aliases.get(p.strip().lower(), p.strip().lower())
+
+
+def call_provider_for_text(
+    settings: Dict[str, str],
+    master_key: bytes,
+    provider: str,
+    message: str,
+    model_override: Optional[str],
+    timeout: int,
+    force_json: bool = False,
+) -> str:
+    p = provider_alias(provider)
+
+    if p == "openai":
+        api_key = read_secret(settings, master_key, "secrets.openai.api_key")
+        if not api_key:
+            raise ProviderError("Missing OpenAI API key (secrets.openai.api_key).")
+        model = model_override or settings.get("provider.openai.model", DEFAULT_OPENAI_MODEL)
+        base_url = settings.get("provider.openai.base_url", DEFAULT_OPENAI_BASE_URL)
+        return call_openai(api_key, message, model=model, base_url=base_url, timeout=timeout)
+
+    if p == "anthropic":
+        api_key = read_secret(settings, master_key, "secrets.anthropic.api_key")
+        if not api_key:
+            raise ProviderError("Missing Anthropic API key (secrets.anthropic.api_key).")
+        model = model_override or settings.get("provider.anthropic.model", DEFAULT_ANTHROPIC_MODEL)
+        return call_anthropic(api_key, message, model=model, timeout=timeout)
+
+    if p == "gemini":
+        api_key = read_secret(settings, master_key, "secrets.gemini.api_key", fallback_key="secrets.google.api_key")
+        if not api_key:
+            raise ProviderError("Missing Gemini API key (secrets.gemini.api_key).")
+        model = model_override or settings.get("provider.gemini.model", DEFAULT_GEMINI_MODEL)
+        return call_gemini(api_key, message, model=model, timeout=timeout, force_json=force_json)
+
+    if p == "ollama":
+        base_url = settings.get("provider.ollama.base_url", DEFAULT_OLLAMA_BASE)
+        model = model_override or settings.get("provider.ollama.model", DEFAULT_OLLAMA_MODEL)
+        return call_ollama(base_url, message, model=model, timeout=timeout)
+
+    raise ProviderError(f"Unknown provider: {provider}")
+
+
 # -------------------------
-# Message runner
+# Message runner (spinner per provider + optional global spinner)
 # -------------------------
-def run_message(conn: sqlite3.Connection, message: str, provider_filter: Optional[str], timeout: int) -> int:
+def run_message(conn: sqlite3.Connection, message: str, provider_filter: Optional[str], model_override: Optional[str], timeout: int) -> int:
     settings = get_all_settings(conn)
     provs = enabled_providers(settings)
 
     if provider_filter:
-        pf = provider_filter.strip().lower()
-        aliases = {
-            "openai": "openai",
-            "anthropic": "anthropic",
-            "claude": "anthropic",
-            "gemini": "gemini",
-            "google": "gemini",
-            "ollama": "ollama",
-            "local": "ollama",
-        }
-        pf = aliases.get(pf, pf)
+        pf = provider_alias(provider_filter)
         provs = [p for p in provs if p == pf]
 
     if not provs:
@@ -299,47 +410,38 @@ def run_message(conn: sqlite3.Connection, message: str, provider_filter: Optiona
     results: List[Tuple[str, str]] = []
     failures: List[Tuple[str, str]] = []
 
-    for p in provs:
-        try:
-            if p == "openai":
-                api_key = read_secret(settings, master_key, "secrets.openai.api_key")
-                if not api_key:
-                    raise ProviderError("Missing OpenAI API key (secrets.openai.api_key).")
-                model = settings.get("provider.openai.model", DEFAULT_OPENAI_MODEL)
-                base_url = settings.get("provider.openai.base_url", DEFAULT_OPENAI_BASE_URL)
-                out = call_openai(api_key, message, model=model, base_url=base_url, timeout=timeout)
-                results.append(("OpenAI", out))
+    global_spin = Spinner("Waiting for the agent")
+    global_spin.start()
 
-            elif p == "anthropic":
-                api_key = read_secret(settings, master_key, "secrets.anthropic.api_key")
-                if not api_key:
-                    raise ProviderError("Missing Anthropic API key (secrets.anthropic.api_key).")
-                model = settings.get("provider.anthropic.model", DEFAULT_ANTHROPIC_MODEL)
-                out = call_anthropic(api_key, message, model=model, timeout=timeout)
-                results.append(("Anthropic", out))
+    try:
+        for p in provs:
+            try:
+                global_spin.stop()
+                print(f"\n=== {p.upper()} ===")
+                spin = Spinner(f"Waiting for {p}")
+                spin.start()
 
-            elif p == "gemini":
-                api_key = read_secret(settings, master_key, "secrets.gemini.api_key", fallback_key="secrets.google.api_key")
-                if not api_key:
-                    raise ProviderError("Missing Gemini API key (secrets.gemini.api_key).")
-                model = settings.get("provider.gemini.model", DEFAULT_GEMINI_MODEL)
-                out = call_gemini(api_key, message, model=model, timeout=timeout)
-                results.append(("Gemini", out))
+                out = call_provider_for_text(settings, master_key, p, message, model_override, timeout)
 
-            elif p == "ollama":
-                base_url = settings.get("provider.ollama.base_url", DEFAULT_OLLAMA_BASE)
-                model = settings.get("provider.ollama.model", DEFAULT_OLLAMA_MODEL)
-                out = call_ollama(base_url, message, model=model, timeout=timeout)
-                results.append(("Ollama", out))
+                results.append((p.capitalize(), out))
+                spin.stop()
+                print("Done.\n")
 
-            else:
-                raise ProviderError(f"Unknown provider '{p}'")
+            except Exception as e:
+                try:
+                    spin.stop()
+                except Exception:
+                    pass
+                failures.append((p, str(e)))
+            finally:
+                if p != provs[-1]:
+                    global_spin.start()
 
-        except Exception as e:
-            failures.append((p, str(e)))
+    finally:
+        global_spin.stop()
 
     for name, out in results:
-        print(f"\n=== {name} ===\n{out}\n")
+        print(f"\n--- {name} response ---\n{out}\n")
 
     if failures:
         print("\n--- Errors ---")
@@ -351,7 +453,327 @@ def run_message(conn: sqlite3.Connection, message: str, provider_filter: Optiona
 
 
 # -------------------------
-# Onboarding (all models via arrow keys selection)
+# Agent mode (writes files + runs commands + fixes until OK)
+# -------------------------
+AGENT_JSON_SCHEMA = """
+Return ONLY valid JSON:
+
+{
+  "plan": ["..."],
+  "files": [
+    {"path": "relative/path", "content": "full file content"},
+    ...
+  ],
+  "commands": [
+    ["cmd", "arg1", "arg2"],
+    ...
+  ],
+  "run_instructions": "How the user runs/tests it",
+  "notes": "short notes"
+}
+
+Rules:
+- paths MUST be relative, no absolute paths, no ".."
+- put ALL code in files (not in notes)
+- commands should be runnable in the workspace directory
+"""
+
+# still block the most destructive stuff (even in wide mode)
+AGENT_BLOCK_PATTERNS = [
+    r"\brm\b\s+-rf\s+/\b",
+    r"\bsudo\b",
+    r"\bmkfs\b",
+    r"\bshutdown\b|\breboot\b",
+]
+
+# default “safe-ish” allowlist (can be disabled via --agent-wide)
+AGENT_ALLOWED = {
+    "python", "python3",
+    "pip", "pip3",
+    "npm", "node",
+    "pnpm", "yarn",
+    "npx",
+    "pytest",
+    "bash", "sh",
+    "git",
+    "docker",
+    "docker-compose",
+    "make",
+}
+
+
+def _sanitize_task_name(name: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-")[:60]
+    return safe or "task"
+
+
+def agent_make_workspace(task: str) -> Path:
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    ws = (WORKSPACE_ROOT / f"{stamp}-{_sanitize_task_name(task)}").resolve()
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
+
+
+def agent_tree(ws: Path, max_entries: int = 250) -> str:
+    lines: List[str] = []
+    count = 0
+    for root, dirs, files in os.walk(ws):
+        rootp = Path(root)
+        relroot = rootp.relative_to(ws)
+        dirs[:] = [d for d in dirs if d not in {".git", "node_modules", ".venv", "__pycache__", ".pytest_cache"}]
+        for f in files:
+            p = relroot / f
+            lines.append(str(p))
+            count += 1
+            if count >= max_entries:
+                lines.append("... (truncated)")
+                return "\n".join(lines)
+    return "\n".join(lines) if lines else "(empty)"
+
+
+def agent_parse_json(raw: str) -> Dict[str, Any]:
+    raw = (raw or "").strip()
+
+    if not raw:
+        raise ValueError("Agent returned empty response (no JSON).")
+
+    # Remove common code fences if present
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.I)
+    raw = re.sub(r"\s*```$", "", raw.strip())
+
+    # First try direct JSON
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # Salvage JSON object from within text
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = raw[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    preview = raw[:400].replace("\n", "\\n")
+    raise ValueError(f"Agent did not return valid JSON. Preview: {preview}")
+
+
+def agent_write_files(ws: Path, files: List[Dict[str, str]]) -> None:
+    for f in files:
+        path = (f.get("path") or "").strip()
+        content = f.get("content")
+        if content is None:
+            content = ""
+        if not path or ".." in path or path.startswith("/") or path.startswith("\\"):
+            raise ValueError(f"Unsafe path from agent: {path}")
+        p = safe_join(ws, path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(str(content), encoding="utf-8")
+
+
+def _shlex_join(cmd: List[str]) -> str:
+    def q(s: str) -> str:
+        if re.search(r"\s|\"", s):
+            return '"' + s.replace('"', '\\"') + '"'
+        return s
+    return " ".join(q(c) for c in cmd)
+
+
+def agent_cmd_allowed(cmd: List[str], wide: bool) -> Tuple[bool, str]:
+    if not cmd:
+        return False, "Empty command"
+    raw = " ".join(cmd)
+    for pat in AGENT_BLOCK_PATTERNS:
+        if re.search(pat, raw):
+            return False, f"Blocked pattern: {pat}"
+    if wide:
+        return True, ""
+    if cmd[0] not in AGENT_ALLOWED:
+        return False, f"Not allowed in safe mode: {cmd[0]} (use --agent-wide)"
+    return True, ""
+
+
+def agent_run_cmd(ws: Path, cmd: List[str], timeout_s: int, approve: bool, wide: bool) -> Tuple[bool, int, str, str]:
+    ok, reason = agent_cmd_allowed(cmd, wide=wide)
+    if not ok:
+        return False, 127, "", f"Blocked: {reason}"
+
+    if approve:
+        print(f"\nAbout to run:\n  {_shlex_join(cmd)}\n")
+        ans = input("Run this command? [y/N]: ").strip().lower()
+        if ans != "y":
+            return False, 126, "", "User declined command"
+
+    p = subprocess.run(
+        cmd,
+        cwd=str(ws),
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    return p.returncode == 0, p.returncode, p.stdout, p.stderr
+
+
+def build_agent_prompt(task: str, ws: Path, last_logs: str) -> str:
+    tree = agent_tree(ws)
+    return f"""
+You are Orqestra Agent: you create code, write files, and provide shell commands to build/run/test.
+
+{AGENT_JSON_SCHEMA}
+
+Task:
+{task}
+
+Workspace tree:
+{tree}
+
+Last execution logs (if any):
+{last_logs}
+""".strip()
+
+
+def run_agent(
+    conn: sqlite3.Connection,
+    task: str,
+    provider: Optional[str],
+    model_override: Optional[str],
+    timeout: int,
+    iters: int,
+    approve: bool,
+    wide: bool,
+    cmd_timeout: int,
+) -> int:
+    settings = get_all_settings(conn)
+    provs = enabled_providers(settings)
+    if not provs:
+        print("No providers enabled. Run: python3 orqestra.py --onboard")
+        return 2
+
+    # pick provider: explicit --provider or first enabled
+    chosen = provider_alias(provider) if provider else provs[0]
+    if chosen not in provs:
+        print(f"Provider '{chosen}' not enabled. Enabled: {', '.join(provs)}")
+        return 2
+
+    master_key = load_or_create_master_key()
+
+    ws = agent_make_workspace(task)
+    print(f"\n[Agent] Workspace: {ws}")
+
+    last_logs = ""
+    final_instructions = ""
+
+    for i in range(1, iters + 1):
+        print(f"\n[Agent] Iteration {i}/{iters}")
+        spin = Spinner("Waiting for the agent")
+        spin.start()
+        try:
+            prompt = build_agent_prompt(task, ws, last_logs)
+
+            # Force JSON for Gemini (safe for others; ignored)
+            raw = call_provider_for_text(
+                settings, master_key, chosen, prompt, model_override, timeout,
+                force_json=True
+            )
+
+            # Retry once if empty
+            if not (raw or "").strip():
+                retry_prompt = prompt + "\n\nIMPORTANT: Return ONLY valid JSON. No markdown. No explanations."
+                raw = call_provider_for_text(
+                    settings, master_key, chosen, retry_prompt, model_override, timeout,
+                    force_json=True
+                )
+        finally:
+            spin.stop()
+
+        data = agent_parse_json(raw)
+
+        plan = data.get("plan") or []
+        files = data.get("files") or []
+        commands = data.get("commands") or []
+        final_instructions = (data.get("run_instructions") or "").strip()
+
+        if plan:
+            print("\n[Plan]")
+            for p in plan:
+                print(f"- {p}")
+
+        if files:
+            print(f"\n[Agent] Writing {len(files)} file(s)...")
+            agent_write_files(ws, files)
+
+        if not commands:
+            print("\n[Agent] No commands provided. Stopping.")
+            break
+
+        print(f"\n[Agent] Running {len(commands)} command(s)...")
+        logs_parts: List[str] = []
+        all_ok = True
+
+        for idx, c in enumerate(commands, start=1):
+            if not isinstance(c, list) or not all(isinstance(x, str) for x in c):
+                all_ok = False
+                logs_parts.append(f"[cmd {idx}] INVALID COMMAND: {c}")
+                break
+
+            print(f"  -> {_shlex_join(c)}")
+            run_spin = Spinner("Executing")
+            run_spin.start()
+            try:
+                ok, rc, out, err = agent_run_cmd(ws, c, timeout_s=cmd_timeout, approve=approve, wide=wide)
+            except subprocess.TimeoutExpired:
+                run_spin.stop()
+                ok, rc, out, err = False, 124, "", f"Command timed out after {cmd_timeout}s"
+            finally:
+                run_spin.stop()
+
+            status = "OK" if ok else "FAIL"
+            print(f"     [{status}] exit={rc}")
+
+            logs_parts.append(
+                "\n".join(
+                    [
+                        f"[cmd {idx}] {_shlex_join(c)}",
+                        f"exit={rc}",
+                        "stdout:",
+                        out[-4000:] if out else "",
+                        "stderr:",
+                        err[-4000:] if err else "",
+                        "-" * 40,
+                    ]
+                )
+            )
+
+            if not ok:
+                all_ok = False
+                break
+
+        last_logs = "\n".join(logs_parts)
+
+        if all_ok:
+            print("\n[Agent] ✅ All commands succeeded.")
+            break
+        else:
+            print("\n[Agent] ❌ Failure detected, asking agent to fix...")
+
+    print("\n=========================")
+    print("AGENT DONE")
+    print("=========================")
+    print(f"Workspace: {ws}")
+    if final_instructions:
+        print("\nRun instructions:\n")
+        print(final_instructions)
+    else:
+        print("\nNo run instructions returned. Check workspace and logs above.")
+    return 0
+
+
+# -------------------------
+# Onboarding (Ollama models fetched from API, all models via arrow keys)
 # -------------------------
 def onboard(conn: sqlite3.Connection) -> None:
     existing = get_all_settings(conn)
@@ -402,7 +824,10 @@ def onboard(conn: sqlite3.Connection) -> None:
         choices=[
             questionary.Choice("OpenAI", checked=existing.get("provider.openai.enabled", "false") == "true"),
             questionary.Choice("Anthropic (Claude)", checked=existing.get("provider.anthropic.enabled", "false") == "true"),
-            questionary.Choice("Gemini", checked=(existing.get("provider.gemini.enabled", "false") == "true" or existing.get("provider.google.enabled", "false") == "true")),
+            questionary.Choice(
+                "Gemini",
+                checked=(existing.get("provider.gemini.enabled", "false") == "true" or existing.get("provider.google.enabled", "false") == "true"),
+            ),
             questionary.Choice("Ollama (local)", checked=existing.get("provider.ollama.enabled", "false") == "true"),
         ],
     ).ask()
@@ -414,13 +839,12 @@ def onboard(conn: sqlite3.Connection) -> None:
     enable_gemini = "Gemini" in providers
     enable_ollama = "Ollama (local)" in providers
 
-    # --- OpenAI ---
+    # OpenAI
     openai_key = ""
     openai_base_url = existing.get("provider.openai.base_url", DEFAULT_OPENAI_BASE_URL)
     openai_model_existing = existing.get("provider.openai.model", DEFAULT_OPENAI_MODEL)
     if openai_model_existing not in OPENAI_MODEL_CHOICES:
-        openai_model_existing = DEFAULT_OPENAI_MODEL if DEFAULT_OPENAI_MODEL in OPENAI_MODEL_CHOICES else OPENAI_MODEL_CHOICES[0]
-
+        openai_model_existing = OPENAI_MODEL_CHOICES[0]
     if enable_openai:
         openai_base_url = questionary.text("OpenAI base URL:", default=openai_base_url).ask() or openai_base_url
         openai_model = questionary.select("OpenAI model (arrow keys):", choices=OPENAI_MODEL_CHOICES, default=openai_model_existing).ask()
@@ -433,12 +857,11 @@ def onboard(conn: sqlite3.Connection) -> None:
     else:
         openai_model = openai_model_existing
 
-    # --- Anthropic ---
+    # Anthropic
     anthropic_key = ""
     anthropic_model_existing = existing.get("provider.anthropic.model", DEFAULT_ANTHROPIC_MODEL)
     if anthropic_model_existing not in ANTHROPIC_MODEL_CHOICES:
-        anthropic_model_existing = DEFAULT_ANTHROPIC_MODEL if DEFAULT_ANTHROPIC_MODEL in ANTHROPIC_MODEL_CHOICES else ANTHROPIC_MODEL_CHOICES[0]
-
+        anthropic_model_existing = ANTHROPIC_MODEL_CHOICES[0]
     if enable_anthropic:
         anthropic_model = questionary.select("Anthropic model (arrow keys):", choices=ANTHROPIC_MODEL_CHOICES, default=anthropic_model_existing).ask()
         if anthropic_model is None:
@@ -450,12 +873,11 @@ def onboard(conn: sqlite3.Connection) -> None:
     else:
         anthropic_model = anthropic_model_existing
 
-    # --- Gemini ---
+    # Gemini
     gemini_key = ""
     gemini_model_existing = existing.get("provider.gemini.model", DEFAULT_GEMINI_MODEL)
     if gemini_model_existing not in GEMINI_MODEL_CHOICES:
-        gemini_model_existing = DEFAULT_GEMINI_MODEL if DEFAULT_GEMINI_MODEL in GEMINI_MODEL_CHOICES else GEMINI_MODEL_CHOICES[0]
-
+        gemini_model_existing = GEMINI_MODEL_CHOICES[0]
     if enable_gemini:
         gemini_model = questionary.select("Gemini model (arrow keys):", choices=GEMINI_MODEL_CHOICES, default=gemini_model_existing).ask()
         if gemini_model is None:
@@ -467,15 +889,20 @@ def onboard(conn: sqlite3.Connection) -> None:
     else:
         gemini_model = gemini_model_existing
 
-    # --- Ollama ---
+    # Ollama (fetch models)
     ollama_base = existing.get("provider.ollama.base_url", DEFAULT_OLLAMA_BASE)
     ollama_model_existing = existing.get("provider.ollama.model", DEFAULT_OLLAMA_MODEL)
-    if ollama_model_existing not in OLLAMA_MODEL_CHOICES:
-        ollama_model_existing = DEFAULT_OLLAMA_MODEL if DEFAULT_OLLAMA_MODEL in OLLAMA_MODEL_CHOICES else OLLAMA_MODEL_CHOICES[0]
-
     if enable_ollama:
         ollama_base = questionary.text("Ollama base URL:", default=ollama_base).ask() or ollama_base
-        ollama_model = questionary.select("Ollama model (arrow keys):", choices=OLLAMA_MODEL_CHOICES, default=ollama_model_existing).ask()
+        try:
+            models = ollama_list_models(ollama_base, timeout=10)
+        except Exception as e:
+            questionary.print(f"Could not fetch Ollama models from {ollama_base}: {e}", style="bold fg:red")
+            models = []
+        if not models:
+            models = sorted(set([ollama_model_existing, DEFAULT_OLLAMA_MODEL]))
+        default_pick = ollama_model_existing if ollama_model_existing in models else models[0]
+        ollama_model = questionary.select("Ollama model (fetched from API):", choices=models, default=default_pick).ask()
         if ollama_model is None:
             raise SystemExit(130)
     else:
@@ -533,11 +960,23 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="orqestra.py")
     ap.add_argument("--onboard", action="store_true", help="Run interactive onboarding")
     ap.add_argument("--db", default=DEFAULT_DB, help=f"SQLite DB path (default: {DEFAULT_DB})")
+
     ap.add_argument("--message", type=str, help='Send a message to your agent, e.g. --message "Hello"')
     ap.add_argument("--provider", type=str, default=None, help="Filter: openai|anthropic|gemini|ollama")
+    ap.add_argument("--model", type=str, default=None, help="Model override for the selected provider")
     ap.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds")
+
     ap.add_argument("--show", action="store_true", help="Show all saved settings (secrets hidden)")
     ap.add_argument("--show-secrets", action="store_true", help="Show decrypted secrets (requires master key)")
+    ap.add_argument("--ollama-models", action="store_true", help="List Ollama models from configured base URL")
+
+    # ---- AGENT MODE ----
+    ap.add_argument("--agent", type=str, help='Run coding agent, e.g. --agent "build a web UI with login"')
+    ap.add_argument("--agent-iters", type=int, default=6, help="Max fix iterations")
+    ap.add_argument("--agent-approve", action="store_true", help="Ask before each command")
+    ap.add_argument("--agent-wide", action="store_true", help="Disable allowlist (still blocks sudo + obvious destructive patterns)")
+    ap.add_argument("--agent-cmd-timeout", type=int, default=900, help="Per-command timeout seconds")
+
     args = ap.parse_args()
 
     conn = db_connect(args.db)
@@ -548,8 +987,28 @@ def main() -> int:
             onboard(conn)
             return 0
 
+        if args.ollama_models:
+            settings = get_all_settings(conn)
+            base = settings.get("provider.ollama.base_url", DEFAULT_OLLAMA_BASE)
+            for m in ollama_list_models(base):
+                print(m)
+            return 0
+
+        if args.agent is not None:
+            return run_agent(
+                conn=conn,
+                task=args.agent,
+                provider=args.provider,
+                model_override=args.model,
+                timeout=args.timeout,
+                iters=args.agent_iters,
+                approve=args.agent_approve,
+                wide=args.agent_wide,
+                cmd_timeout=args.agent_cmd_timeout,
+            )
+
         if args.message is not None:
-            return run_message(conn, args.message, provider_filter=args.provider, timeout=args.timeout)
+            return run_message(conn, args.message, provider_filter=args.provider, model_override=args.model, timeout=args.timeout)
 
         if args.show or args.show_secrets:
             settings = get_all_settings(conn)
