@@ -1,6 +1,6 @@
 # Orqestra - Personal AI Assistant
 
-/ɔːrˈkɛstrə/
+/ɔːrˈkɛstrə/ - 
 or-KEH-stra
 
 Schon gemacht:
