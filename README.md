@@ -1,5 +1,8 @@
 # Orqestra - Personal AI Assistant
 
+/ɔːrˈkɛstrə/
+or-KEH-stra
+
 Schon gemacht:
 ```bash
 python -m venv orqestra
