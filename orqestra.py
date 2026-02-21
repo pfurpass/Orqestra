@@ -170,6 +170,10 @@ def main() -> int:
             for k, v in get_all_settings(conn).items():
                 print(f"{k} = {v}")
             return 0
+        
+        if args.db:
+            print(f"Test")
+            return 0
 
         ap.print_help()
         return 0
