@@ -1,1 +1,1 @@
-pip install questionary cryptography
+pip install questionary cryptography requests
